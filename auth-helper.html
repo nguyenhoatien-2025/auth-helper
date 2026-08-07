@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TOTP & Password</title>
+<style>
+  body { margin: 16px; }
+  input {
+    display: block; box-sizing: border-box; width: 100%; max-width: 24em;
+    font: 20px ui-monospace, monospace; padding: 10px; margin: 8px 0;
+  }
+  input[readonly] { background: #f4f4f4; }
+</style>
+<input id="totp" placeholder="TOTP secret" autocomplete="off" autocapitalize="off" spellcheck="false" onfocus="select()">
+<input id="pw" readonly onfocus="select()">
+
+<script>
+const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+";
+// 256 % 76 != 0, so reject the tail to keep every character equally likely
+pw.value = [...crypto.getRandomValues(new Uint8Array(64))]
+  .filter(b => b < 256 - 256 % CHARS.length).slice(0, 20).map(b => CHARS[b % CHARS.length]).join("");
+
+function base32(s) {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0, value = 0; const out = [];
+  for (const c of s.toUpperCase().replace(/[^A-Z2-7]/g, "")) {
+    value = (value << 5) | A.indexOf(c); bits += 5;
+    if (bits >= 8) out.push((value >>> (bits -= 8)) & 255);
+  }
+  return new Uint8Array(out);
+}
+
+let secret = "";
+
+async function tick() {
+  if (!secret) return;
+  const key = await crypto.subtle.importKey("raw", base32(secret), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const step = Math.floor(Date.now() / 30000);
+  const msg = new DataView(new ArrayBuffer(8));
+  msg.setUint32(0, Math.floor(step / 2 ** 32)); msg.setUint32(4, step);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, msg.buffer));
+  const o = mac[19] & 15;
+  const bin = ((mac[o] & 127) << 24) | (mac[o + 1] << 16) | (mac[o + 2] << 8) | mac[o + 3];
+  totp.value = String(bin % 1e6).padStart(6, "0");
+}
+
+// The one field swaps roles: paste a secret, it turns into the code display
+totp.oninput = () => { secret = totp.value.trim(); totp.readOnly = !!secret; totp.blur(); tick(); };
+setInterval(tick, 1000);
+</script>
