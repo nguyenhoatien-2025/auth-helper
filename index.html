@@ -1,49 +1,195 @@
+
 <!DOCTYPE html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TOTP & Password</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Auth Helper</title>
 <style>
-  body { margin: 16px; }
-  input {
-    display: block; box-sizing: border-box; width: 100%; max-width: 24em;
-    font: 20px ui-monospace, monospace; padding: 10px; margin: 8px 0;
-  }
-  input[readonly] { background: #f4f4f4; }
+body{max-width:560px;margin:0 auto;padding:32px 16px 64px;background:#fff;color:#111;
+     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+h1{font-size:18px;margin:0 0 20px}
+label{display:block;font-size:12px;font-weight:600;color:#666;margin:16px 0 5px}
+input,textarea{width:100%;padding:9px 11px;border:1px solid #ccc;border-radius:6px;
+               font-size:14px;font-family:ui-monospace,Menlo,Consolas,monospace;background:#fff;color:#111}
+input:focus,textarea:focus{outline:2px solid #2a5bd7;outline-offset:-1px;border-color:#2a5bd7}
+textarea{resize:vertical;min-height:80px;word-break:break-all}
+textarea.ok{border-color:#0f7b4f}
+textarea.err{border-color:#b32020}
+button{margin-top:12px;margin-right:6px;padding:9px 14px;border:1px solid #ccc;border-radius:6px;
+       background:#fff;color:#111;font-size:13px;font-family:inherit;cursor:pointer}
+button:hover{border-color:#2a5bd7}
+#code{font:600 26px/1 ui-monospace,Menlo,Consolas,monospace;letter-spacing:.1em;color:#0f7b4f;margin-top:8px}
+#code.bad{font-size:13px;font-weight:400;letter-spacing:0;color:#b32020}
+#secs{font-size:12px;color:#666;margin-top:4px}
+#status{font-size:12px;color:#666;margin-top:8px;min-height:18px}
+#status.ok{color:#0f7b4f}
+#status.err{color:#b32020}
+p.note{font-size:12px;color:#666;line-height:1.55;margin-top:28px}
 </style>
-<input id="totp" placeholder="TOTP secret" autocomplete="off" autocapitalize="off" spellcheck="false" onfocus="select()">
-<input id="pw" readonly onfocus="select()">
+</head>
+<body>
+
+<h1>Auth Helper</h1>
+
+<label for="master">Master password</label>
+<input id="master" type="password" autocomplete="off" spellcheck="false">
+
+<label for="pw">Password</label>
+<input id="pw" type="text" autocomplete="off" spellcheck="false">
+
+<label for="secret">2FA secret</label>
+<input id="secret" type="text" autocomplete="off" spellcheck="false" placeholder="NEUT QBLB 4LXU …">
+
+<div id="code" hidden>— — —</div>
+<div id="secs" hidden></div>
+
+<label for="cipher">Encrypted string</label>
+<textarea id="cipher" autocomplete="off" spellcheck="false" placeholder="Generated as you type above, or paste one here to unlock."></textarea>
+<div id="status"></div>
+<button id="copyLink" type="button">Copy link</button>
+<button id="clear" type="button">Clear</button>
+
+<p class="note">
+AES-256-GCM with PBKDF2-SHA256 (600k iterations), all in your browser.
+No server, no storage. The encrypted string lives after the <code>#</code> in the URL,
+which browsers never send to a server. When sharing a link, send the master password
+through a different channel.
+</p>
 
 <script>
-const CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+";
-// 256 % 76 != 0, so reject the tail to keep every character equally likely
-pw.value = [...crypto.getRandomValues(new Uint8Array(64))]
-  .filter(b => b < 256 - 256 % CHARS.length).slice(0, 20).map(b => CHARS[b % CHARS.length]).join("");
+'use strict';
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+const master = $('master'), pw = $('pw'), secret = $('secret'), cipher = $('cipher');
 
-function base32(s) {
-  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  let bits = 0, value = 0; const out = [];
-  for (const c of s.toUpperCase().replace(/[^A-Z2-7]/g, "")) {
-    value = (value << 5) | A.indexOf(c); bits += 5;
-    if (bits >= 8) out.push((value >>> (bits -= 8)) & 255);
+const b64 = {
+  e: buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),
+  d: str => { const s = str.replace(/-/g,'+').replace(/_/g,'/');
+              return Uint8Array.from(atob(s + '='.repeat((4 - s.length % 4) % 4)), c => c.charCodeAt(0)); }
+};
+
+const key = salt => crypto.subtle
+  .importKey('raw', enc.encode(master.value), 'PBKDF2', false, ['deriveKey'])
+  .then(k => crypto.subtle.deriveKey(
+    { name:'PBKDF2', salt, iterations:600000, hash:'SHA-256' }, k,
+    { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']));
+
+/* TOTP — HMAC-SHA1, 6 digits, 30s (RFC 6238) */
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+async function totp(raw){
+  const s = raw.toUpperCase().replace(/[\s-]/g,'').replace(/=+$/,'');
+  let bits = 0, val = 0; const bytes = [];
+  for (const c of s){
+    const i = B32.indexOf(c);
+    if (i < 0) throw 0;
+    val = (val << 5) | i; bits += 5;
+    if (bits >= 8) bytes.push((val >>> (bits -= 8)) & 0xff);
   }
-  return new Uint8Array(out);
-}
-
-let secret = "";
-
-async function tick() {
-  if (!secret) return;
-  const key = await crypto.subtle.importKey("raw", base32(secret), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
-  const step = Math.floor(Date.now() / 30000);
+  if (!bytes.length) throw 0;
+  const counter = Math.floor(Date.now() / 30000);
   const msg = new DataView(new ArrayBuffer(8));
-  msg.setUint32(0, Math.floor(step / 2 ** 32)); msg.setUint32(4, step);
-  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, msg.buffer));
-  const o = mac[19] & 15;
-  const bin = ((mac[o] & 127) << 24) | (mac[o + 1] << 16) | (mac[o + 2] << 8) | mac[o + 3];
-  totp.value = String(bin % 1e6).padStart(6, "0");
+  msg.setUint32(0, Math.floor(counter / 4294967296));
+  msg.setUint32(4, counter >>> 0);
+  const k = await crypto.subtle.importKey('raw', new Uint8Array(bytes), { name:'HMAC', hash:'SHA-1' }, false, ['sign']);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', k, msg.buffer));
+  const o = mac[19] & 0x0f;
+  const n = ((mac[o] & 0x7f) << 24) | (mac[o+1] << 16) | (mac[o+2] << 8) | mac[o+3];
+  return String(n % 1000000).padStart(6, '0');
 }
 
-// The one field swaps roles: paste a secret, it turns into the code display
-totp.oninput = () => { secret = totp.value.trim(); totp.readOnly = !!secret; totp.blur(); tick(); };
+let salt = crypto.getRandomValues(new Uint8Array(16));
+let iv   = crypto.getRandomValues(new Uint8Array(12));
+let quiet = false, timer;
+
+const status = (msg, cls) => { $('status').textContent = msg; $('status').className = cls || ''; };
+const mark = cls => { cipher.className = cls || ''; };
+const setHash = v => history.replaceState(null, '', location.pathname + (v ? '#' + v : ''));
+
+async function encrypt(){
+  if (!pw.value && !secret.value){
+    quiet = true; cipher.value = ''; quiet = false;
+    mark(); setHash(''); status(''); return;
+  }
+  if (!master.value) return status('Enter a master password to encrypt');
+  status('Encrypting…');
+  const ct = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, await key(salt),
+    enc.encode(JSON.stringify({ p: pw.value, s: secret.value })));
+  const blob = `v1.${b64.e(salt)}.${b64.e(iv)}.${b64.e(ct)}`;
+  quiet = true; cipher.value = blob; quiet = false;
+  mark('ok'); setHash(blob); status('Encrypted', 'ok');
+}
+
+async function decrypt(){
+  const blob = cipher.value.trim();
+  if (!blob){ mark(); setHash(''); status(''); return; }
+  if (!master.value) return status('Enter a master password to decrypt');
+  status('Decrypting…');
+  try {
+    const p = blob.split('.');
+    if (p.length !== 4 || p[0] !== 'v1') throw 'FORMAT';
+    const s = b64.d(p[1]), i = b64.d(p[2]);
+    const pt = await crypto.subtle.decrypt({ name:'AES-GCM', iv:i }, await key(s), b64.d(p[3]));
+    const data = JSON.parse(dec.decode(pt));
+    salt = s; iv = i;
+    quiet = true; pw.value = data.p || ''; secret.value = data.s || ''; quiet = false;
+    mark('ok'); setHash(blob); status('Decrypted', 'ok'); tick();
+  } catch (e){
+    mark('err');
+    status(e === 'FORMAT' ? 'Malformed string' : 'Wrong master password, or the string is corrupt', 'err');
+  }
+}
+
+const run = fn => { if (!quiet){ clearTimeout(timer); timer = setTimeout(fn, 400); } };
+[pw, secret].forEach(el => el.addEventListener('input', () => { run(encrypt); tick(); }));
+cipher.addEventListener('input', () => run(decrypt));
+master.addEventListener('input', () =>
+  run(cipher.value.trim() && !pw.value && !secret.value ? decrypt : encrypt));
+
+async function tick(){
+  const raw = secret.value.trim();
+  $('code').hidden = $('secs').hidden = !raw;
+  if (!raw) return;
+  $('secs').textContent = (30 - Math.floor(Date.now() / 1000 % 30)) + 's left';
+  try {
+    const c = await totp(raw);
+    $('code').className = '';
+    $('code').textContent = c.slice(0,3) + ' ' + c.slice(3);
+  } catch {
+    $('code').className = 'bad';
+    $('code').textContent = 'Not a valid Base32 secret';
+  }
+}
 setInterval(tick, 1000);
+
+$('copyLink').addEventListener('click', e => {
+  const blob = cipher.value.trim();
+  if (!blob) return status('Nothing to share yet', 'err');
+  navigator.clipboard.writeText(location.origin + location.pathname + '#' + blob);
+  e.target.textContent = 'Copied';
+  setTimeout(() => { e.target.textContent = 'Copy link'; }, 1000);
+});
+
+$('clear').addEventListener('click', () => {
+  clearTimeout(timer);
+  quiet = true;
+  master.value = pw.value = secret.value = cipher.value = '';
+  quiet = false;
+  salt = crypto.getRandomValues(new Uint8Array(16));
+  iv   = crypto.getRandomValues(new Uint8Array(12));
+  mark(); setHash(''); status('Cleared', 'ok'); tick(); master.focus();
+});
+
+if (!crypto.subtle){
+  status('This browser has no Web Crypto — open the page over HTTPS', 'err');
+} else if (location.hash.length > 1){
+  cipher.value = location.hash.slice(1).trim();
+  status('This link holds data — enter the master password to unlock');
+  master.focus();
+}
 </script>
+</body>
+</html>
